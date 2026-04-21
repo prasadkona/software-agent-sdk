@@ -17,7 +17,6 @@ from pydantic import (
     SecretStr,
     SerializationInfo,
     ValidationInfo,
-    field_serializer,
     model_serializer,
     model_validator,
 )
@@ -38,10 +37,11 @@ from openhands.sdk.tool import (
     resolve_tool,
 )
 from openhands.sdk.tool.builtins import InvokeSkillTool
-from openhands.sdk.utils.models import DiscriminatedUnionMixin
+from openhands.sdk.utils.models import DiscriminatedUnionMixin, get_handler_class_name
 
 
 if TYPE_CHECKING:
+    from openhands.sdk.utils.cipher import Cipher
     from openhands.sdk.conversation import ConversationState, LocalConversation
     from openhands.sdk.conversation.types import (
         ConversationCallbackType,
@@ -93,9 +93,6 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
         examples=[
             {"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}
         ],
-        # Note: mcp_config may contain expanded secrets. A field_serializer is used
-        # to redact sensitive fields (env, headers, tokens) during serialization.
-        # See _serialize_mcp_config below.
     )
     filter_tools_regex: str | None = Field(
         default=None,
@@ -245,55 +242,25 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
 
         return data
 
-    @field_serializer("mcp_config", when_used="always")
-    def _serialize_mcp_config(
-        self, config: dict[str, Any], info: SerializationInfo
-    ) -> dict[str, Any] | None:
-        """Serialize mcp_config with encryption or redaction.
-
-        Follows the standard SDK secret handling pattern:
-        - If a cipher is provided in context: returns None (encryption handled
-          by model_serializer which stores encrypted_mcp_config)
-        - If expose_secrets flag is True in context: returns the config as-is
-        - Otherwise: returns None to redact sensitive MCP configuration
-
-        This ensures mcp_config secrets don't leak to API responses or WebSocket
-        events, while still allowing encrypted persistence for conversation resume.
-        """
-        if not config:
-            return config
-
-        # If cipher is present, we'll encrypt instead (handled in model_serializer)
-        if info.context and info.context.get("cipher"):
-            return None
-
-        # If expose_secrets is True, return the config as-is
-        if info.context and info.context.get("expose_secrets"):
-            return config
-
-        # Default: redact by returning None
-        return None
-
     @model_serializer(mode="wrap")
-    def _serialize_with_encrypted_mcp(
-        self, handler: Any, info: SerializationInfo
-    ) -> dict[str, Any]:
-        """Serialize the agent, handling mcp_config encryption.
+    def _serialize_with_mcp_handling(self, handler, info: SerializationInfo):
+        """Serialize the agent, handling mcp_config encryption/redaction.
 
-        When a cipher is present in context and mcp_config has content:
-        - Encrypts mcp_config as JSON and stores in encrypted_mcp_config
-        - Removes the None mcp_config from output for cleaner serialization
+        This serializer handles:
+        1. Polymorphic serialization for subclasses (e.g., ACPAgent)
+        2. mcp_config encryption when cipher is in context
+        3. mcp_config redaction (omission) when neither cipher nor expose_secrets
 
-        This also handles polymorphic serialization for subclasses (like ACPAgent)
-        by delegating to model_dump when the handler is not for the actual class.
+        The mcp_config handling is done here (not in a field_serializer) to avoid
+        changing the field's schema type, which would break REST API compatibility.
         """
+        if isinstance(self, dict):
+            # Sometimes pydantic passes a dict in here.
+            return self
+
         # Check if handler is for the current (actual) class
-        handler_str = str(handler)
-        if "=" in handler_str:
-            _, handler_class = handler_str.split("=", 1)
-            handler_class = handler_class.rstrip(")")
-        else:
-            handler_class = self.__class__.__name__
+        # See get_handler_class_name() for details on the fragile string parsing
+        handler_class = get_handler_class_name(handler)
 
         if handler_class != self.__class__.__name__:
             # Handler is for a base class, delegate to model_dump for proper
@@ -311,18 +278,31 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
         else:
             result = handler(self)
 
-        # Add encrypted_mcp_config if cipher is present and mcp_config has content
-        if self.mcp_config and info.context and info.context.get("cipher"):
-            cipher = info.context["cipher"]
+        # Handle mcp_config based on context:
+        # - Empty config: omit (nothing sensitive, default value)
+        # - expose_secrets=True: keep as-is (explicitly requested)
+        # - cipher present: encrypt and store in encrypted_mcp_config, omit original
+        # - default: omit (redact sensitive data)
+        if not self.mcp_config:  # Only process non-empty configs
+            result.pop("mcp_config", None)
+            return result
+        elif info.context and info.context.get("cipher"):
+            # Encrypt and add encrypted_mcp_config
+            cipher: Cipher = info.context["cipher"]
             json_str = json.dumps(self.mcp_config)
             encrypted = cipher.encrypt(SecretStr(json_str))
             if encrypted:
                 result["encrypted_mcp_config"] = encrypted
-            # Remove the None mcp_config if present (cleaner output)
-            if "mcp_config" in result and result["mcp_config"] is None:
-                del result["mcp_config"]
-
-        return result
+            # Remove plaintext mcp_config
+            result.pop("mcp_config", None)
+            return result
+        elif info.context and info.context.get("expose_secrets"):
+            # Keep mcp_config as-is (already in result from handler)
+            return result
+        else:
+            # Default: redact by omitting
+            result.pop("mcp_config", None)
+            return result
 
     condenser: CondenserBase | None = Field(
         default=None,
