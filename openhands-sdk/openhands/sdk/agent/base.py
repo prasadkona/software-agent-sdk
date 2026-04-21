@@ -41,12 +41,12 @@ from openhands.sdk.utils.models import DiscriminatedUnionMixin, get_handler_clas
 
 
 if TYPE_CHECKING:
-    from openhands.sdk.utils.cipher import Cipher
     from openhands.sdk.conversation import ConversationState, LocalConversation
     from openhands.sdk.conversation.types import (
         ConversationCallbackType,
         ConversationTokenCallbackType,
     )
+    from openhands.sdk.utils.cipher import Cipher
 
 logger = get_logger(__name__)
 
